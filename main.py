@@ -215,3 +215,5 @@ def start_interview():
             "marks":iq_questions[0].marks
         }
     }
+
+print ("My name is Moez UL Islam")
