@@ -5,11 +5,17 @@ from fastapi import FastAPI,Path
 from pydantic import BaseModel,Field
 from typing import Annotated
 from dotenv import load_dotenv
-import json
+from database import engine,SessionLocal
+from sqlalchemy.orm import Session
+from fastapi import Depends
+import crud
+import schemas
+import models
 import os
-import uuid
 load_dotenv(".env")
 API_KEY=os.getenv("OPENROUTER_API_KEY")
+
+models.Base.metadata.create_all(bind=engine)
 
 model=ChatOpenAI(
     api_key=API_KEY,
@@ -18,6 +24,15 @@ model=ChatOpenAI(
 )
 app=FastAPI()
 parser=JsonOutputParser()
+
+def get_db():
+    db=SessionLocal()
+    try:
+        yield db
+
+    finally:
+        db.close()
+
 
 prompt = PromptTemplate(
     template="""
@@ -32,27 +47,51 @@ Expected Answer:
 Candidate Answer:
 {candidate_answer}
 
-Evaluate the candidate answer.
+Previous Feedback:
+{previous_feedback}
 
-Rules:
-1. Return ONLY valid JSON.
-2. Use EXACTLY these keys:
-   - correct (boolean)
-   - score (integer from 0 to 10)
-   - feedback (string)
+Previous Followup Question:
+{followup_question}
 
-Example:
+Followup Attempts:
+{followup_count}
+
+Evaluate the answer.
+
+Return ONLY JSON.
+
 {{
     "correct": true,
     "score": 10,
-    "feedback": "Good answer"
+    "feedback": "...",
+    "needs_followup": false,
+    "followup_question": ""
 }}
-""",
-    input_variables=[
-        "question",
-        "expected_answer",
-        "candidate_answer"
-    ]
+
+Rules:
+
+If the answer is incomplete but partially correct:
+
+correct=false
+
+needs_followup=true
+
+Generate ONE follow-up question.
+
+If answer is completely correct:
+
+correct=true
+
+needs_followup=false
+
+followup_question=""
+
+If followup_count is 2 or greater:
+
+- Do NOT generate another follow-up question.
+- Set needs_followup to false.
+- Evaluate the final answer and give the final score.
+"""
 )
 
 chain= prompt|model|parser
@@ -130,7 +169,6 @@ Question(
     marks=10
 )
 ]
-sessions={}
 
 @app.get('/questions/{question_id}')
 def get_question(question_id:int=Path(...,gt=0)):
@@ -143,18 +181,23 @@ def get_question(question_id:int=Path(...,gt=0)):
             }
     return {'message':'Question not found.'}
 
-class AnswerRequest(BaseModel):
-    session_id:str
-    answer:str
 
 @app.post('/submit-answer')
-def submit_answer(request: AnswerRequest):
+def submit_answer(
+    request:schemas.AnswerRequest,
+    db:Session=Depends(get_db)
+    ):
+    interview = crud.get_interview_session(
+    db=db,
+    session_id=request.session_id
+    )
 
-    if request.session_id not in sessions:
-        return {'message': 'Invalid session'}
+    if interview is None:
+     return {
+        "message": "Interview not found."
+    }
 
-    session = sessions[request.session_id]
-    current_question = session["current_question"]
+    current_question = interview.current_question
 
     for question in iq_questions:
 
@@ -164,35 +207,76 @@ def submit_answer(request: AnswerRequest):
                 response = chain.invoke({
                     "question": question.question,
                     "expected_answer": question.answer,
-                    "candidate_answer": request.answer
+                    "candidate_answer": request.answer,
+                    "previous_feedback": interview.last_feedback,
+                    "followup_question": interview.last_followup,
+                    "followup_count":interview.followup_count
                 })
             except Exception as e:
                 return {
                     "message": "AI evaluation failed",
                     "error": str(e)
     }
-            print(response)
-            print(type(response))
-            print(response.keys())
-            score = min(response["score"], question.marks)
+            
+            if response["needs_followup"]:
+
+                interview.last_feedback = response["feedback"]
+                interview.last_followup = response["followup_question"]
+
+                if interview.followup_count >= 2:
+
+                    interview.followup_count = 0
+
+                else:
+
+                    interview.followup_count += 1
+
+                    db.commit()
+                    db.refresh(interview)
+
+                    return {
+                        "correct": False,
+                        "feedback": response["feedback"],
+                        "followup_question": response["followup_question"]
+                    }
             if response["correct"]:
-                session["score"] += question.marks
-            session["current_question"] += 1
+                interview.score += min(response["score"], question.marks)
+            crud.save_answer(
+            db=db,
+            session_id=interview.id,
+            question_id=question.id,
+            candidate_answer=request.answer,
+            ai_score=response["score"],
+            feedback=response["feedback"],
+            followup_count=interview.followup_count
+            )
+            interview.last_feedback = ""
+            interview.last_followup = ""
+            interview.followup_count = 0
+            interview.current_question += 1
+
+            db.commit()
+            db.refresh(interview)
                 
-            if session["current_question"] > len(iq_questions):
+            if interview.current_question > len(iq_questions):
+                crud.complete_interview(
+                db=db,
+                session_id=interview.id,
+                final_score=interview.score
+                )
                 return {
                     "message": "Interview Completed",
                     "correct": response["correct"],
                     "feedback": response["feedback"],
-                    "total_score": session["score"]
+                    "total_score": interview.score
                 }
                 
-            next_question = iq_questions[session["current_question"] - 1]
+            next_question = iq_questions[interview.current_question - 1]
 
             return {
                 "correct": response["correct"],
                 "feedback": response["feedback"],
-                "total_score": session["score"],
+                "total_score": interview.score,
                 "next_question": {
                     "id": next_question.id,
                     "question": next_question.question,
@@ -201,19 +285,53 @@ def submit_answer(request: AnswerRequest):
             }
     return {"message": "Question not found"}
 @app.post('/start-interview')
-def start_interview():
-    session_id=str(uuid.uuid4())
-    sessions[session_id]={
-        "current_question":1,
-        "score":0
-    }
+def start_interview(
+    request:schemas.StartInterviewRequest,
+    db:Session=Depends(get_db)
+    ):
+    user = (
+    db.query(models.User)
+    .filter(models.User.id == request.user_id)
+    .first()
+    )
+
+    if user is None:
+        return {
+            "message": "User not found."
+        }
+    interview = crud.create_interview_session(
+        db=db,
+        user_id=request.user_id
+    )
     return {
-        "session_id":session_id,
+        "session_id":interview.id,
         "question":{
             "id":iq_questions[0].id,
             "question":iq_questions[0].question,
             "marks":iq_questions[0].marks
         }
     }
+@app.post("/users")
+def create_user(
+    user: schemas.UserCreate,
+    db: Session = Depends(get_db)
+    ):
 
-print ("My name is Moez UL Islam")
+    existing_user = crud.get_user_by_email(db, user.email)
+
+    if existing_user:
+        return {
+            "message": "Email already exists."
+        }
+
+    new_user = crud.create_user(
+        db=db,
+        name=user.name,
+        email=user.email,
+        date_of_birth=user.date_of_birth
+    )
+
+    return {
+        "message": "User created successfully.",
+        "user": new_user
+    }
