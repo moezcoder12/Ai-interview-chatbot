@@ -1,13 +1,25 @@
 from langchain_openai import ChatOpenAI
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
-from fastapi import FastAPI,Path
+from voice.speech_to_text import transcribe_audio
+from voice.text_to_speech import speak
 from pydantic import BaseModel,Field
 from typing import Annotated
 from dotenv import load_dotenv
-from database import engine,SessionLocal
+from database import engine,SessionLocal,get_db
 from sqlalchemy.orm import Session
-from fastapi import Depends
+from fastapi.security import OAuth2PasswordBearer
+from fastapi import Depends,HTTPException,UploadFile,File,Path,FastAPI,status
+from exceptions import (
+    InterviewException,
+    interview_exception_handler,
+    http_exception_handler,
+    global_exception_handler
+)
+from security import hash_password
+from schemas import LoginRequest,TokenResponse
+from security import verify_password,create_access_token,verify_access_token
 import crud
 import schemas
 import models
@@ -23,15 +35,56 @@ model=ChatOpenAI(
     model="meta-llama/llama-3.3-70b-instruct"
 )
 app=FastAPI()
+oauth2_scheme=OAuth2PasswordBearer(tokenUrl="login")
+app.add_exception_handler(
+    InterviewException,
+    interview_exception_handler
+)
+app.add_exception_handler(
+    HTTPException,
+    http_exception_handler
+)
+app.add_exception_handler(
+    Exception,
+    global_exception_handler
+)
 parser=JsonOutputParser()
 
-def get_db():
-    db=SessionLocal()
-    try:
-        yield db
+security = HTTPBearer()
 
-    finally:
-        db.close()
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    db: Session = Depends(get_db)
+):
+    token = credentials.credentials
+
+    payload = verify_access_token(token)
+
+    if payload is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or expired token"
+        )
+
+    user_id = payload.get("user_id")
+
+    if user_id is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid token"
+        )
+
+    user = db.query(models.User).filter(
+        models.User.id == user_id
+    ).first()
+
+    if user is None:
+        raise HTTPException(
+            status_code=401,
+            detail="User not found"
+        )
+
+    return user
 
 
 prompt = PromptTemplate(
@@ -95,6 +148,174 @@ If followup_count is 2 or greater:
 )
 
 chain= prompt|model|parser
+def evaluate_candidate(
+    question,
+    candidate_answer,
+    previous_feedback="",
+    followup_question="",
+    followup_count=0
+):
+
+    response = chain.invoke({
+        "question": question.question,
+        "expected_answer": question.answer,
+        "candidate_answer": candidate_answer,
+        "previous_feedback": previous_feedback,
+        "followup_question": followup_question,
+        "followup_count": followup_count
+    })
+
+    return response
+
+def process_answer(session_id: int,answer: str,db: Session):
+    interview = crud.get_interview_session(
+        db=db,
+        session_id=session_id
+    )
+    if interview is None:
+        raise HTTPException(status_code=404,detail="Interview not found")
+    current_question = interview.current_question
+    for question in iq_questions:
+
+        if question.id != current_question:
+            continue
+
+        response = evaluate_candidate(
+            question=question,
+            candidate_answer=answer,
+            previous_feedback=interview.last_feedback,
+            followup_question=interview.last_followup,
+            followup_count=interview.followup_count
+        )
+        if response["needs_followup"]:
+
+            interview.last_feedback = response["feedback"]
+            interview.last_followup = response["followup_question"]
+
+            if interview.followup_count >= 2:
+                interview.followup_count = 0
+
+            else:
+                interview.followup_count += 1
+
+                db.commit()
+                db.refresh(interview)
+
+                return {
+                    "correct": False,
+                    "feedback": response["feedback"],
+                    "followup_question": response["followup_question"]
+                }
+        if response["correct"]:
+            interview.score += min(
+                response["score"],
+                question.marks
+            )
+
+        crud.save_answer(
+            db=db,
+            session_id=interview.id,
+            question_id=question.id,
+            candidate_answer=answer,
+            ai_score=response["score"],
+            feedback=response["feedback"],
+            followup_count=interview.followup_count
+        )
+
+        interview.last_feedback = ""
+        interview.last_followup = ""
+        interview.followup_count = 0
+        interview.current_question += 1
+
+        db.commit()
+        db.refresh(interview)
+
+        if interview.current_question > len(iq_questions):
+
+            crud.complete_interview(
+                db=db,
+                session_id=interview.id,
+                final_score=interview.score
+            )
+
+            return {
+                "message": "Interview Completed",
+                "correct": response["correct"],
+                "feedback": response["feedback"],
+                "total_score": interview.score
+            }
+
+        next_question = iq_questions[
+            interview.current_question - 1
+        ]
+
+        return {
+            "correct": response["correct"],
+            "feedback": response["feedback"],
+            "total_score": interview.score,
+            "next_question": {
+                "id": next_question.id,
+                "question": next_question.question,
+                "marks": next_question.marks
+            }
+        }
+
+    raise HTTPException(status_code=404,detail="Question not found")
+
+def build_interview_report(
+    interview,
+    answers,
+    user
+    ):
+
+    answer_reports = []
+
+    for answer in answers:
+
+        question = iq_questions[
+            answer.question_id - 1
+        ]
+
+        answer_reports.append(
+
+            schemas.AnswerReport(
+                question_id=question.id,
+                question=question.question,
+                expected_answer=question.answer,
+                candidate_answer=answer.candidate_answer,
+                ai_score=answer.ai_score,
+                feedback=answer.feedback,
+                followup_count=answer.followup_count
+            )
+        )
+
+    percentage = round(
+        (interview.score / 100) * 100,
+        2
+    )
+
+    report = schemas.InterviewReport(
+
+        session_id=interview.id,
+
+        candidate=schemas.CandidateReport(
+            id=user.id,
+            name=user.name,
+            email=user.email
+        ),
+
+        score=interview.score,
+        percentage=percentage,
+
+        status=interview.status,
+
+        started_at=interview.started_at,
+        completed_at=interview.completed_at,
+
+        answers=answer_reports
+    )
+
+    return report
 
 class Question(BaseModel):
     id: Annotated[int,Field(...,description="Id of the question",examples=[1, 3, 4])]
@@ -179,136 +400,133 @@ def get_question(question_id:int=Path(...,gt=0)):
                 'question':question.question,
                 'marks':question.marks
             }
-    return {'message':'Question not found.'}
+    raise HTTPException(status_code=404,detail="Question not found")
 
+@app.get("/me", response_model=schemas.UserResponse)
+def get_me(
+    current_user: models.User = Depends(get_current_user)
+):
+    return current_user
 
-@app.post('/submit-answer')
-def submit_answer(
-    request:schemas.AnswerRequest,
-    db:Session=Depends(get_db)
-    ):
-    interview = crud.get_interview_session(
-    db=db,
-    session_id=request.session_id
-    )
-
-    if interview is None:
-     return {
-        "message": "Interview not found."
-    }
-
-    current_question = interview.current_question
-
-    for question in iq_questions:
-
-        if question.id == current_question:
-
-            try:
-                response = chain.invoke({
-                    "question": question.question,
-                    "expected_answer": question.answer,
-                    "candidate_answer": request.answer,
-                    "previous_feedback": interview.last_feedback,
-                    "followup_question": interview.last_followup,
-                    "followup_count":interview.followup_count
-                })
-            except Exception as e:
-                return {
-                    "message": "AI evaluation failed",
-                    "error": str(e)
-    }
-            
-            if response["needs_followup"]:
-
-                interview.last_feedback = response["feedback"]
-                interview.last_followup = response["followup_question"]
-
-                if interview.followup_count >= 2:
-
-                    interview.followup_count = 0
-
-                else:
-
-                    interview.followup_count += 1
-
-                    db.commit()
-                    db.refresh(interview)
-
-                    return {
-                        "correct": False,
-                        "feedback": response["feedback"],
-                        "followup_question": response["followup_question"]
-                    }
-            if response["correct"]:
-                interview.score += min(response["score"], question.marks)
-            crud.save_answer(
-            db=db,
-            session_id=interview.id,
-            question_id=question.id,
-            candidate_answer=request.answer,
-            ai_score=response["score"],
-            feedback=response["feedback"],
-            followup_count=interview.followup_count
-            )
-            interview.last_feedback = ""
-            interview.last_followup = ""
-            interview.followup_count = 0
-            interview.current_question += 1
-
-            db.commit()
-            db.refresh(interview)
-                
-            if interview.current_question > len(iq_questions):
-                crud.complete_interview(
-                db=db,
-                session_id=interview.id,
-                final_score=interview.score
-                )
-                return {
-                    "message": "Interview Completed",
-                    "correct": response["correct"],
-                    "feedback": response["feedback"],
-                    "total_score": interview.score
-                }
-                
-            next_question = iq_questions[interview.current_question - 1]
-
-            return {
-                "correct": response["correct"],
-                "feedback": response["feedback"],
-                "total_score": interview.score,
-                "next_question": {
-                    "id": next_question.id,
-                    "question": next_question.question,
-                    "marks": next_question.marks
-                }
-            }
-    return {"message": "Question not found"}
-@app.post('/start-interview')
-def start_interview(
-    request:schemas.StartInterviewRequest,
-    db:Session=Depends(get_db)
-    ):
-    user = (
-    db.query(models.User)
-    .filter(models.User.id == request.user_id)
-    .first()
+@app.post("/login", response_model=schemas.LoginResponse)
+def login(
+    data: schemas.LoginRequest,
+    db: Session = Depends(get_db)
+):
+    user = crud.get_user_by_email(
+        db,
+        data.email
     )
 
     if user is None:
-        return {
-            "message": "User not found."
-        }
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid email or password"
+        )
+
+    if not verify_password(
+        data.password,
+        user.password
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid email or password"
+        )
+
+    access_token = create_access_token({
+        "user_id": user.id,
+        "email": user.email
+    })
+
+    return {
+        "message": "Login successful",
+        "user_id": user.id,
+        "name": user.name,
+        "email": user.email,
+        "access_token": access_token,
+        "token_type": "bearer"
+    }
+
+
+@app.post("/submit-answer")
+def submit_answer(
+    request: schemas.AnswerRequest,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+
+    interview = crud.get_interview_session(
+        db=db,
+        session_id=request.session_id
+    )
+
+    if interview is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Interview session not found"
+        )
+
+    if interview.user_id != current_user.id:
+        raise HTTPException(
+            status_code=403,
+            detail="You are not allowed to access this interview"
+        )
+
+    return process_answer(
+        session_id=request.session_id,
+        answer=request.answer,
+        db=db
+    )
+@app.post("/submit-audio")
+async def submit_audio(session_id: int, audio: UploadFile = File(...), db: Session = Depends(get_db)):
+
+    os.makedirs("recordings", exist_ok=True)
+
+    audio_path = f"recordings/{audio.filename}"
+
+    with open(audio_path, "wb") as f:
+        f.write(await audio.read())
+    transcript = transcribe_audio(audio_path)
+
+    if os.path.exists(audio_path):
+        os.remove(audio_path)
+    result = process_answer(
+    session_id=session_id,
+    answer=transcript,
+    db=db
+    )
+    if "feedback" in result:
+        await speak(result["feedback"])
+
+    if "next_question" in result:
+
+        next_q = result["next_question"]["question"]
+
+        await speak(next_q)
+    return {
+        "transcript": transcript,
+        "result": result
+    }
+@app.post("/start-interview")
+async def start_interview(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
     interview = crud.create_interview_session(
         db=db,
-        user_id=request.user_id
+        user_id=current_user.id
     )
+
+    question_text = iq_questions[0].question
+
+    await speak(question_text)
+
     return {
-        "session_id":interview.id,
-        "question":{
-            "id":iq_questions[0].id,
-            "question":iq_questions[0].question,
-            "marks":iq_questions[0].marks
+        "session_id": interview.id,
+        "question": {
+            "id": iq_questions[0].id,
+            "question": iq_questions[0].question,
+            "marks": iq_questions[0].marks
         }
     }
 @app.post("/users")
@@ -317,17 +535,23 @@ def create_user(
     db: Session = Depends(get_db)
     ):
 
-    existing_user = crud.get_user_by_email(db, user.email)
+    existing_user = crud.get_user_by_email(
+        db,
+        user.email
+    )
 
     if existing_user:
         return {
             "message": "Email already exists."
         }
 
+    hashed_password = hash_password(user.password)
+
     new_user = crud.create_user(
         db=db,
         name=user.name,
         email=user.email,
+        password=hashed_password,
         date_of_birth=user.date_of_birth
     )
 
@@ -335,3 +559,41 @@ def create_user(
         "message": "User created successfully.",
         "user": new_user
     }
+@app.get(
+    "/report/{session_id}",
+    response_model=schemas.InterviewReport
+)
+def get_report(
+    session_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+
+    interview = crud.get_interview_session(
+        db=db,
+        session_id=session_id
+    )
+
+    if interview is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Interview session not found"
+        )
+
+    if interview.user_id != current_user.id:
+        raise HTTPException(
+            status_code=403,
+            detail="You are not allowed to access this interview"
+        )
+
+    if interview.status != "Completed":
+        raise HTTPException(
+            status_code=400,
+            detail="Interview is not completed yet."
+        )
+
+    return crud.generate_report(
+        db=db,
+        session_id=session_id,
+        iq_questions=iq_questions
+    )
