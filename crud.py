@@ -183,3 +183,30 @@ def generate_report(db: Session, session_id: int, iq_questions: list):
 
         answers=answer_reports
     )
+
+def get_all_interviews(
+    db: Session
+):
+    return (
+        db.query(InterviewSession)
+        .order_by(InterviewSession.id.desc())
+        .all()
+    )
+def delete_user(
+    db: Session,
+    user_id: int
+):
+
+    user = (
+        db.query(User)
+        .filter(User.id == user_id)
+        .first()
+    )
+
+    if user is None:
+        return None
+
+    db.delete(user)
+    db.commit()
+
+    return user

@@ -25,14 +25,13 @@ import schemas
 import models
 import os
 load_dotenv(".env")
-API_KEY=os.getenv("OPENROUTER_API_KEY")
+API_KEY=os.getenv("OPENAI_API_KEY")
 
 models.Base.metadata.create_all(bind=engine)
 
 model=ChatOpenAI(
     api_key=API_KEY,
-    base_url="https://openrouter.ai/api/v1",
-    model="meta-llama/llama-3.3-70b-instruct"
+    model="gpt-5.6-terra"
 )
 app=FastAPI()
 oauth2_scheme=OAuth2PasswordBearer(tokenUrl="login")
@@ -86,6 +85,15 @@ def get_current_user(
 
     return user
 
+def get_current_admin(
+        current_user:models.User=Depends(get_current_user)
+):
+    if current_user.role != "admin":
+        raise HTTPException(
+            status_code=403,
+            detail="Admin access required"
+        )
+    return current_user
 
 prompt = PromptTemplate(
     template="""
@@ -597,3 +605,87 @@ def get_report(
         session_id=session_id,
         iq_questions=iq_questions
     )
+
+@app.get("/admin/interviews")
+def get_all_interviews(
+    db: Session = Depends(get_db),
+    current_admin: models.User = Depends(get_current_admin)
+):
+
+    interviews = crud.get_all_interviews(db)
+
+    results = []
+
+    for interview in interviews:
+
+        user = interview.user
+
+        results.append({
+            "session_id": interview.id,
+            "candidate": {
+                "id": user.id,
+                "name": user.name,
+                "email": user.email
+            },
+            "score": interview.score,
+            "status": interview.status,
+            "started_at": interview.started_at,
+            "completed_at": interview.completed_at
+        })
+
+    return results
+
+@app.get(
+    "/admin/interviews/{session_id}",
+    response_model=schemas.InterviewReport
+)
+def admin_interview_report(
+    session_id: int,
+    db: Session = Depends(get_db),
+    current_admin: models.User = Depends(get_current_admin)
+):
+
+    report = crud.generate_report(
+        db=db,
+        session_id=session_id,
+        iq_questions=iq_questions
+    )
+
+    if report is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Interview not found"
+        )
+
+    return report
+
+@app.delete("/admin/candidates/{user_id}")
+def delete_candidate(
+    user_id: int,
+    db: Session = Depends(get_db),
+    current_admin: models.User = Depends(get_current_admin)
+):
+
+    if user_id == current_admin.id:
+        raise HTTPException(
+            status_code=400,
+            detail="Admin cannot delete itself"
+        )
+
+    user = crud.delete_user(
+        db=db,
+        user_id=user_id
+    )
+
+    if user is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Candidate not found"
+        )
+
+    return {
+        "message": "Candidate deleted successfully",
+        "user_id": user.id,
+        "name": user.name,
+        "email": user.email
+    }
