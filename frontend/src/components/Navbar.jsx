@@ -3,7 +3,7 @@ import { Link } from 'react-router-dom'
 
 const Navbar = () => {
   return (
-    <div className='flex justify-between items-center h-20 w-full  bg-black/30 border-b border-white/30 shadow-lg backdrop-blur-xl'>
+    <div className='fixed top-0 left-0 z-50 flex justify-between items-center h-20 w-full  bg-black/30 border-b border-white/30 shadow-lg backdrop-blur-sm'>
       <img
       className='flex w-44 ml-5'
       src="/truespokenlogo.png" 

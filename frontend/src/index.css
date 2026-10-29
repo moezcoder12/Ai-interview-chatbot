@@ -1,1 +1,11 @@
 @import "tailwindcss";
+
+/* Hide scrollbar across the entire website */
+* {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+*::-webkit-scrollbar {
+  display: none;
+}
