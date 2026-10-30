@@ -1,6 +1,7 @@
 from pydantic import BaseModel,EmailStr,Field
 from datetime import date
 from datetime import datetime
+from typing import Optional
 
 class LoginRequest(BaseModel):
     email:EmailStr
@@ -21,6 +22,8 @@ class UserResponse(BaseModel):
     id: int
     name: str
     email: EmailStr
+    date_of_birth: Optional[date] = None
+    role: str = "candidate"
 
     class Config:
         from_attributes = True

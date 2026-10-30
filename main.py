@@ -34,6 +34,15 @@ model=ChatOpenAI(
     model="gpt-5.6-terra"
 )
 app=FastAPI()
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Production mein specific frontend URL dein
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 oauth2_scheme=OAuth2PasswordBearer(tokenUrl="login")
 app.add_exception_handler(
     InterviewException,
@@ -486,31 +495,51 @@ def submit_answer(
         db=db
     )
 @app.post("/submit-audio")
-async def submit_audio(session_id: int, audio: UploadFile = File(...), db: Session = Depends(get_db)):
-
+async def submit_audio(
+    session_id: int, 
+    audio: UploadFile = File(...), 
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user) # Current user protection add ki
+):
     os.makedirs("recordings", exist_ok=True)
 
-    audio_path = f"recordings/{audio.filename}"
+    # Unique file name banayein taake conflict na ho
+    file_extension = audio.filename.split(".")[-1] if "." in audio.filename else "wav"
+    audio_path = f"recordings/session_{session_id}_{audio.filename}"
 
     with open(audio_path, "wb") as f:
         f.write(await audio.read())
-    transcript = transcribe_audio(audio_path)
 
+    try:
+        # Transcribe audio file
+        transcript = transcribe_audio(audio_path)
+    except Exception as e:
+        if os.path.exists(audio_path):
+            os.remove(audio_path)
+        raise HTTPException(status_code=500, detail=f"Audio transcription failed: {str(e)}")
+
+    # Cleanup local recording file
     if os.path.exists(audio_path):
         os.remove(audio_path)
+
+    # Process answer in DB
     result = process_answer(
-    session_id=session_id,
-    answer=transcript,
-    db=db
+        session_id=session_id,
+        answer=transcript,
+        db=db
     )
-    if "feedback" in result:
-        await speak(result["feedback"])
 
-    if "next_question" in result:
+    # Audio speech feedback safely handle karein
+    try:
+        if "feedback" in result and result["feedback"]:
+            await speak(result["feedback"])
 
-        next_q = result["next_question"]["question"]
+        if "next_question" in result and "question" in result["next_question"]:
+            next_q = result["next_question"]["question"]
+            await speak(next_q)
+    except Exception as e:
+        print(f"Speech warning: {e}")
 
-        await speak(next_q)
     return {
         "transcript": transcript,
         "result": result
@@ -689,3 +718,26 @@ def delete_candidate(
         "name": user.name,
         "email": user.email
     }
+@app.get("/interviews/my")
+def get_my_interviews(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    interviews = (
+        db.query(models.InterviewSession)
+        .filter(models.InterviewSession.user_id == current_user.id)
+        .order_by(models.InterviewSession.started_at.desc())
+        .all()
+    )
+
+    results = []
+    for interview in interviews:
+        results.append({
+            "session_id": interview.id,
+            "score": interview.score,
+            "status": interview.status,
+            "started_at": interview.started_at,
+            "completed_at": interview.completed_at
+        })
+
+    return results

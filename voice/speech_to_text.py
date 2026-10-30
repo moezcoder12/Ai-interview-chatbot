@@ -1,23 +1,19 @@
-from faster_whisper import WhisperModel
+import os
+from openai import OpenAI
+from dotenv import load_dotenv
 
-model = WhisperModel(
-    "small",
-    device="cpu",
-    compute_type="int8"
-)
+load_dotenv(".env")
 
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-def transcribe_audio(audio_path: str):
-    segments, info = model.transcribe(
-    audio_path,
-    beam_size=5,
-    language="en",
-    vad_filter=True
-    )
+def transcribe_audio(audio_path: str) -> str:
+    if not os.path.exists(audio_path):
+        raise FileNotFoundError(f"Audio file not found: {audio_path}")
 
-    text = ""
-
-    for segment in segments:
-        text += segment.text + " "
-
-    return text.strip()
+    with open(audio_path, "rb") as audio_file:
+        transcript = client.audio.transcriptions.create(
+            model="whisper-1",
+            file=audio_file
+        )
+    
+    return transcript.text.strip()

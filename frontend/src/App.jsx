@@ -7,6 +7,7 @@ import Signup from './pages/Signup'
 import Profile from './pages/profile'
 import Interview from './pages/Interview'
 import Result from './pages/Result'
+import AdminDashboard from './pages/AdminDashboard'
 import { Route, Routes } from "react-router-dom";
 
 const App = () => {
@@ -21,6 +22,7 @@ const App = () => {
         <Route path='/profile' element={<Profile/>}/>
         <Route path='/interview' element={<Interview/>}/>
         <Route path='/result' element={<Result/>}/>
+        <Route path='/admin' element={<AdminDashboard/>}/>
       </Routes>
     </div>
   )
