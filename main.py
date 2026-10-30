@@ -23,7 +23,6 @@ from security import verify_password,create_access_token,verify_access_token
 import crud
 import schemas
 import models
-from fastapi.middleware.cors import CORSMiddleware
 import os
 load_dotenv(".env")
 API_KEY=os.getenv("OPENAI_API_KEY")
@@ -34,17 +33,15 @@ model=ChatOpenAI(
     api_key=API_KEY,
     model="gpt-5.6-terra"
 )
+app=FastAPI()
 from fastapi.middleware.cors import CORSMiddleware
-
-app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # Production mein specific frontend URL dein
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["*"]
 )
 oauth2_scheme=OAuth2PasswordBearer(tokenUrl="login")
 app.add_exception_handler(
@@ -608,7 +605,6 @@ def get_report(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user)
 ):
-
     interview = crud.get_interview_session(
         db=db,
         session_id=session_id
@@ -620,7 +616,8 @@ def get_report(
             detail="Interview session not found"
         )
 
-    if interview.user_id != current_user.id:
+    # Candidate or Admin both can access the report
+    if interview.user_id != current_user.id and current_user.role != "admin":
         raise HTTPException(
             status_code=403,
             detail="You are not allowed to access this interview"
@@ -637,7 +634,6 @@ def get_report(
         session_id=session_id,
         iq_questions=iq_questions
     )
-
 @app.get("/admin/interviews")
 def get_all_interviews(
     db: Session = Depends(get_db),
