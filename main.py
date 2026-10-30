@@ -23,6 +23,7 @@ from security import verify_password,create_access_token,verify_access_token
 import crud
 import schemas
 import models
+from fastapi.middleware.cors import CORSMiddleware
 import os
 load_dotenv(".env")
 API_KEY=os.getenv("OPENAI_API_KEY")
@@ -33,15 +34,17 @@ model=ChatOpenAI(
     api_key=API_KEY,
     model="gpt-5.6-terra"
 )
-app=FastAPI()
 from fastapi.middleware.cors import CORSMiddleware
+
+app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Production mein specific frontend URL dein
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
+    expose_headers=["*"]
 )
 oauth2_scheme=OAuth2PasswordBearer(tokenUrl="login")
 app.add_exception_handler(
