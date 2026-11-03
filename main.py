@@ -503,7 +503,7 @@ async def submit_audio(
 ):
     os.makedirs("recordings", exist_ok=True)
 
-    # Unique file name banayein taake conflict na ho
+    
     file_extension = audio.filename.split(".")[-1] if "." in audio.filename else "wav"
     audio_path = f"recordings/session_{session_id}_{audio.filename}"
 
@@ -511,25 +511,24 @@ async def submit_audio(
         f.write(await audio.read())
 
     try:
-        # Transcribe audio file
+        
         transcript = transcribe_audio(audio_path)
     except Exception as e:
         if os.path.exists(audio_path):
             os.remove(audio_path)
         raise HTTPException(status_code=500, detail=f"Audio transcription failed: {str(e)}")
 
-    # Cleanup local recording file
+    
     if os.path.exists(audio_path):
         os.remove(audio_path)
 
-    # Process answer in DB
+   
     result = process_answer(
         session_id=session_id,
         answer=transcript,
         db=db
     )
 
-    # Audio speech feedback safely handle karein
     try:
         if "feedback" in result and result["feedback"]:
             await speak(result["feedback"])
@@ -616,7 +615,6 @@ def get_report(
             detail="Interview session not found"
         )
 
-    # Candidate or Admin both can access the report
     if interview.user_id != current_user.id and current_user.role != "admin":
         raise HTTPException(
             status_code=403,
