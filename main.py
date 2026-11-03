@@ -499,7 +499,7 @@ async def submit_audio(
     session_id: int, 
     audio: UploadFile = File(...), 
     db: Session = Depends(get_db),
-    current_user: models.User = Depends(get_current_user) # Current user protection add ki
+    current_user: models.User = Depends(get_current_user)
 ):
     os.makedirs("recordings", exist_ok=True)
 
